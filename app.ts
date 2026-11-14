@@ -6,7 +6,8 @@
 //   /<owner>/<repo>.git/git-upload-pack
 //   /<owner>/<repo>.git/git-receive-pack
 //   /api/v3/...                        GitHub REST v3 (Bearer token required)
-//   /api/graphql, /mcp                M2 surfaces; M1 answers a JSON 404
+//   /api/graphql                       GraphQL v4 (Bearer token required)
+//   /mcp                               MCP JSON-RPC 2.0 (Bearer token required)
 //   anything else                      JSON 404 {"message":"Not Found"}
 //
 // Every reply carries a non-empty X-GitHub-Request-Id (a deterministic per-process counter,
@@ -16,6 +17,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { Store } from './store.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack, type GitReply } from './gitwire.ts';
 import { handleRest } from './rest.ts';
+import { handleGraphQL } from './graphql.ts';
+import { handleMcp } from './mcp.ts';
 
 const JSON_TYPE = 'application/json; charset=utf-8';
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
@@ -156,8 +159,41 @@ export function createApp(): Server {
             sendJson(res, 401, { message: 'Requires authentication' }, requestId);
             return;
           }
-          if (pathname === '/api/graphql' || pathname === '/mcp') {
-            sendJson(res, 404, { message: 'Not Found' }, requestId);
+          if (pathname === '/api/graphql') {
+            if (method !== 'POST') {
+              sendJson(res, 404, { message: 'Not Found' }, requestId);
+              return;
+            }
+            const raw = await readBody(req);
+            let body: unknown = null;
+            if (raw.length > 0) {
+              try {
+                body = JSON.parse(raw.toString('utf8'));
+              } catch {
+                sendJson(res, 400, { errors: [{ message: 'Problems parsing JSON' }] }, requestId);
+                return;
+              }
+            }
+            const reply = handleGraphQL(store, body);
+            sendJson(res, reply.status, reply.body, requestId);
+            return;
+          }
+          if (pathname === '/mcp') {
+            if (method === 'DELETE') {
+              sendEmpty(res, 204, requestId);
+              return;
+            }
+            if (method !== 'POST') {
+              sendJson(res, 404, { message: 'Not Found' }, requestId);
+              return;
+            }
+            const raw = await readBody(req);
+            const reply = handleMcp(store, raw);
+            if (reply.body === '') {
+              sendEmpty(res, reply.status, requestId);
+              return;
+            }
+            sendJson(res, reply.status, reply.body, requestId);
             return;
           }
           const segments = splitSegments(pathname.slice('/api/v3'.length));

@@ -403,6 +403,15 @@ function handleRepo(
     return err(404, 'Not Found');
   }
 
+  // GET /repos/{o}/{r}/git/refs/heads/{branch} (and any other single ref).
+  if (head === 'git' && rest[1] === 'refs' && rest.length >= 3) {
+    if (method !== 'GET') return err(404, 'Not Found');
+    const ref = `refs/${rest.slice(2).join('/')}`;
+    const sha = repo.refs.get(ref);
+    if (sha === undefined) return err(404, 'Not Found');
+    return ok({ ref, object: { sha, type: 'commit' } });
+  }
+
   if (head === 'branches' && rest.length === 1) {
     if (method !== 'GET') return err(404, 'Not Found');
     const branches: Json[] = [];
@@ -411,6 +420,14 @@ function handleRepo(
       branches.push({ name: refName.slice('refs/heads/'.length), commit: { sha: repo.refs.get(refName)! }, protected: false });
     }
     return ok(branches);
+  }
+
+  // GET /repos/{o}/{r}/branches/{branch}
+  if (head === 'branches' && rest.length === 2) {
+    if (method !== 'GET') return err(404, 'Not Found');
+    const sha = repo.refs.get(`refs/heads/${rest[1]}`);
+    if (sha === undefined) return err(404, 'Not Found');
+    return ok({ name: rest[1], commit: { sha }, protected: false });
   }
 
   if (head === 'commits' && rest.length === 1) {
@@ -891,3 +908,23 @@ function mergePull(store: Store, repo: Repo, pull: Pull, body: unknown): RestRep
   pull.mergeCommitSha = mergeSha;
   return ok({ merged: true, sha: mergeSha, message });
 }
+
+// ---------------------------------------------------------------------------------------------
+// Re-exports for the GraphQL and MCP surfaces, which mutate the same store through the same
+// code paths as REST (the suite's rest-parity checks read the same objects back over REST).
+// ---------------------------------------------------------------------------------------------
+
+export {
+  commentJson,
+  createComment,
+  createIssue,
+  createPull,
+  createUserRepo,
+  issueJson,
+  mergePull,
+  needRepo,
+  patchIssue,
+  pullFiles,
+  pullJson,
+  repoJson,
+};

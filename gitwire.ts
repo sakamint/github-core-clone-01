@@ -492,12 +492,33 @@ export function planFetch(
   // Depth-limited commit walk: want = depth 1, parents one deeper.
   const included = new Map<string, number>();
   const queue: Array<{ oid: string; d: number }> = [];
+  // Tag objects a want names (and their chain) travel with the fetch; a tag's ultimate target
+  // is wanted like a commit (depth 1) or, for a tree/blob target, with its closure.
+  const extra = new Set<string>();
   for (const want of wants) {
     const object = lookup(want);
     if (!object) continue;
     if (object.type === 'tag') {
-      const target = peelToCommit(repo, want);
-      if (target !== null) queue.push({ oid: target, d: 1 });
+      let current = want;
+      const seenTags = new Set<string>();
+      while (true) {
+        if (seenTags.has(current)) break;
+        seenTags.add(current);
+        const obj = lookup(current);
+        if (!obj || obj.type !== 'tag') break;
+        extra.add(current);
+        let tag;
+        try {
+          tag = parseTag(obj.data);
+        } catch {
+          break;
+        }
+        current = tag.object;
+      }
+      const target = lookup(current);
+      if (!target) continue;
+      if (target.type === 'commit') queue.push({ oid: current, d: 1 });
+      else for (const oid of collectReachable([current], lookup)) extra.add(oid);
       continue;
     }
     if (object.type === 'commit') queue.push({ oid: want, d: 1 });
@@ -536,6 +557,7 @@ export function planFetch(
   // shallow boundary is held without its history (its parents are not held).
   const haveClosure = collectReachableCut(haves, lookup, new Set(oldShallow));
   for (const oid of haveClosure) sendSet.delete(oid);
+  for (const oid of extra) sendSet.add(oid);
   const send: GitObject[] = [];
   for (const oid of [...sendSet].sort()) {
     const object = lookup(oid);
