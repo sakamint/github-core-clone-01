@@ -944,7 +944,6 @@ export {
   createIssue,
   createPull,
   createUserRepo,
-  issueBody,
   issueJson,
   mergePull,
   needRepo,
