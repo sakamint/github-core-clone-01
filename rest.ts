@@ -4,6 +4,7 @@
 // JSON; errors are {message: string}. Owner mismatches are 404, never 403; a missing token is
 // handled by the app layer (401) before these handlers run.
 
+import { noteGitMutation } from './gitwire.ts';
 import {
   buildCommit,
   diffLines,
@@ -124,6 +125,25 @@ function issueJson(store: Store, repo: Repo, issue: Issue): Json {
     created_at: store.stamp(issue.createdSeq),
     updated_at: store.stamp(issue.createdSeq),
   };
+}
+
+/**
+ * One issue's GET body as bytes, memoized on the issue object itself. The body is a pure
+ * function of the issue's fields, so it is rebuilt only when the issue changes; patchIssue
+ * and createComment clear it through forgetIssueBody below.
+ */
+const issueBodies = new WeakMap<Issue, Buffer>();
+
+export function issueBody(store: Store, repo: Repo, issue: Issue): Buffer {
+  const hit = issueBodies.get(issue);
+  if (hit !== undefined) return hit;
+  const made = Buffer.from(`${JSON.stringify(issueJson(store, repo, issue))}\n`, 'utf8');
+  issueBodies.set(issue, made);
+  return made;
+}
+
+function forgetIssueBody(issue: Issue): void {
+  issueBodies.delete(issue);
 }
 
 function pullJson(store: Store, repo: Repo, pull: Pull): Json {
@@ -252,6 +272,7 @@ function commitFiles(
   });
   const commitSha = putObject(repo.objects, 'commit', commit);
   repo.refs.set(`refs/heads/${branch}`, commitSha);
+  noteGitMutation(repo);
   return { commitSha, treeSha };
 }
 
@@ -527,6 +548,7 @@ function createRef(store: Store, repo: Repo, body: unknown): RestReply {
   if (!repo.objects.has(sha)) return err(422, 'Object does not exist');
   if (repo.refs.has(ref)) return err(422, 'Reference already exists');
   repo.refs.set(ref, sha);
+  noteGitMutation(repo);
   return ok({ ref, object: { sha } }, 201);
 }
 
@@ -724,6 +746,7 @@ function patchIssue(store: Store, repo: Repo, issue: Issue, body: unknown): Rest
     const text = asString(input.body);
     if (text !== null) issue.body = text;
   }
+  forgetIssueBody(issue);
   return ok(issueJson(store, repo, issue));
 }
 
@@ -735,6 +758,7 @@ function createComment(store: Store, repo: Repo, issue: Issue, body: unknown): R
   const comment = { id: repo.nextCommentId, body: text, user: store.viewerLogin, createdSeq: store.nextSeq() };
   repo.nextCommentId += 1;
   issue.comments.push(comment);
+  forgetIssueBody(issue);
   return ok(commentJson(store, comment), 201);
 }
 
@@ -920,6 +944,7 @@ export {
   createIssue,
   createPull,
   createUserRepo,
+  issueBody,
   issueJson,
   mergePull,
   needRepo,

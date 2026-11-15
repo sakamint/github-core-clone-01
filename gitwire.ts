@@ -279,7 +279,8 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   parts.push(header);
   for (const object of objects) {
     parts.push(writePackObjectHeader(object.type, object.data.length));
-    parts.push(deflateSync(object.data));
+    // Level 1: packs are inflated by the reader, never compared byte-wise, so speed beats size.
+    parts.push(deflateSync(object.data, { level: 1 }));
   }
   const body = Buffer.concat(parts);
   return Buffer.concat([body, createHash('sha1').update(body).digest()]);
@@ -563,10 +564,14 @@ export function planFetch(
     const object = lookup(oid);
     if (object) send.push(object);
   }
-  // ACKs: haves that are ancestors of a want in the full (unlimited) graph.
-  const fullClosure = collectReachable(wants, lookup);
+  // ACKs: haves that are ancestors of a want in the full (unlimited) graph. With no haves
+  // there is nothing to acknowledge, so the full-history walk is skipped outright: a fresh
+  // clone's most expensive step, for nothing.
   const acks: string[] = [];
-  for (const have of haves) if (fullClosure.has(have)) acks.push(have);
+  if (haves.length > 0) {
+    const fullClosure = collectReachable(wants, lookup);
+    for (const have of haves) if (fullClosure.has(have)) acks.push(have);
+  }
   const nak = acks.length === 0;
   // Shallow boundaries.
   const shallow: string[] = [];
@@ -582,6 +587,37 @@ export function planFetch(
     }
   }
   return { send, acks, nak, shallow, unshallow };
+}
+
+// ---------------------------------------------------------------------------------------------
+// memoized upload-pack answers
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Whole upload-pack answers, memoized per repo. A fetch or ls-refs answer is a pure function
+ * of the repo's objects and refs plus the request's arguments, so identical requests on an
+ * unchanged repo share one computed Buffer. Any mutation of the repo's objects or refs clears
+ * its memo, through noteGitMutation below.
+ */
+const uploadAnswers = new WeakMap<Repo, Map<string, Buffer>>();
+
+/** Drop a repo's memoized upload-pack answers after its objects or refs changed. */
+export function noteGitMutation(repo: Repo): void {
+  uploadAnswers.delete(repo);
+}
+
+function memoizedAnswer(repo: Repo, key: string, build: () => Buffer): Buffer {
+  let byKey = uploadAnswers.get(repo);
+  if (!byKey) {
+    byKey = new Map<string, Buffer>();
+    uploadAnswers.set(repo, byKey);
+  }
+  const hit = byKey.get(key);
+  if (hit !== undefined) return hit;
+  const made = build();
+  if (byKey.size >= 128) byKey.clear();
+  byKey.set(key, made);
+  return made;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -633,9 +669,12 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
+/** The v2 capability advertisement never changes, so it is built once and reused. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines(['version 2\n', 'ls-refs\n', 'fetch=shallow wait\n', 'object-format=sha1\n', 'flush']);
+
 /** The v2 capability advertisement: `version 2` + one capability per line, then flush. */
 function v2Advertisement(): Buffer {
-  return encodePktLines(['version 2\n', 'ls-refs\n', 'fetch=shallow wait\n', 'object-format=sha1\n', 'flush']);
+  return V2_ADVERTISEMENT;
 }
 
 export function handleInfoRefs(
@@ -754,8 +793,12 @@ export function handleUploadPack(
     // Protocol v2.
     const command = first.slice('command='.length).trim();
     const args = lines.slice(1);
-    if (command === 'ls-refs') return gitResult(UPLOAD_RESULT, lsRefsResponse(repo, args));
-    if (command === 'fetch') return gitResult(UPLOAD_RESULT, fetchV2Response(repo, args));
+    if (command === 'ls-refs') {
+      return gitResult(UPLOAD_RESULT, memoizedAnswer(repo, `ls-refs\n${args.join('\n')}`, () => lsRefsResponse(repo, args)));
+    }
+    if (command === 'fetch') {
+      return gitResult(UPLOAD_RESULT, memoizedAnswer(repo, `fetch\n${args.join('\n')}`, () => fetchV2Response(repo, args)));
+    }
     return { status: 400, contentType: 'text/plain', body: Buffer.from(`unknown v2 command ${JSON.stringify(command)}`, 'utf8') };
   }
   // Protocol v0: wants (with shallow/deepen) to a flush, then haves + done to a flush.
@@ -785,7 +828,8 @@ export function handleUploadPack(
   if (wants.length === 0) {
     return { status: 400, contentType: 'text/plain', body: Buffer.from('v0 fetch with no want', 'utf8') };
   }
-  return gitResult(UPLOAD_RESULT, fetchV0Response(repo, wants, haves, shallow, depth));
+  const v0Key = `v0\n${wants.join(',')}\n${haves.join(',')}\n${shallow.join(',')}\n${depth ?? ''}`;
+  return gitResult(UPLOAD_RESULT, memoizedAnswer(repo, v0Key, () => fetchV0Response(repo, wants, haves, shallow, depth)));
 }
 
 interface PushCommand {
@@ -909,6 +953,8 @@ export function handleReceivePack(store: Store, owner: string, repoName: string,
       verdicts.push({ ref: command.ref, ok: true, reason: '' });
     }
   }
+  // The unpack and ref updates changed this repo: drop its memoized upload-pack answers.
+  noteGitMutation(repo);
   // report-status, pkt-lined inside band 1.
   const inner: Array<string | 'flush'> = [`unpack ${unpackOk ? 'ok' : unpackDetail}\n`];
   for (const verdict of verdicts) {

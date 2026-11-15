@@ -16,7 +16,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Store } from './store.ts';
 import { handleInfoRefs, handleReceivePack, handleUploadPack, type GitReply } from './gitwire.ts';
-import { handleRest } from './rest.ts';
+import { createIssue, handleRest, issueBody } from './rest.ts';
 import { handleGraphQL } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
 
@@ -38,6 +38,17 @@ function sendJson(res: ServerResponse, status: number, body: unknown, requestId:
 function sendEmpty(res: ServerResponse, status: number, requestId: string): void {
   res.writeHead(status, { 'content-length': 0, 'x-github-request-id': requestId, 'x-oauth-scopes': 'repo, read:org' });
   res.end();
+}
+
+/** Reply with an already-serialized JSON body (the memoized issue body), no re-stringify. */
+function sendRawJson(res: ServerResponse, status: number, body: Buffer, requestId: string): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': body.length,
+    'x-github-request-id': requestId,
+    'x-oauth-scopes': 'repo, read:org',
+  });
+  res.end(body);
 }
 
 function sendGit(res: ServerResponse, reply: GitReply, requestId: string): void {
@@ -158,6 +169,65 @@ export function createApp(): Server {
           if (token === '' || (store.token !== null && token !== store.token)) {
             sendJson(res, 401, { message: 'Requires authentication' }, requestId);
             return;
+          }
+          // Fast paths for the two hottest REST shapes. Each answers only its exact hit
+          // case and falls through to the normal router for anything else, so behaviour
+          // is identical to the generic path for every other request.
+          if (method === 'GET') {
+            const single = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues\/(\d+)$/.exec(pathname);
+            if (single) {
+              let owner: string | null = null;
+              let repoName: string | null = null;
+              try {
+                owner = decodeURIComponent(single[1]!);
+                repoName = decodeURIComponent(single[2]!);
+              } catch {
+                owner = null;
+                repoName = null;
+              }
+              if (owner !== null && repoName !== null && owner === store.viewerLogin) {
+                const repo = store.getRepo(owner, repoName);
+                if (repo !== undefined) {
+                  const issue = repo.issues.get(parseInt(single[3]!, 10));
+                  if (issue !== undefined) {
+                    sendRawJson(res, 200, issueBody(store, repo, issue), requestId);
+                    return;
+                  }
+                }
+              }
+            }
+          }
+          if (method === 'POST') {
+            const create = /^\/api\/v3\/repos\/([^/]+)\/([^/]+)\/issues$/.exec(pathname);
+            if (create) {
+              let owner: string | null = null;
+              let repoName: string | null = null;
+              try {
+                owner = decodeURIComponent(create[1]!);
+                repoName = decodeURIComponent(create[2]!);
+              } catch {
+                owner = null;
+                repoName = null;
+              }
+              if (owner !== null && repoName !== null && owner === store.viewerLogin) {
+                const repo = store.getRepo(owner, repoName);
+                if (repo !== undefined) {
+                  const raw = await readBody(req);
+                  let parsed: unknown = null;
+                  if (raw.length > 0) {
+                    try {
+                      parsed = JSON.parse(raw.toString('utf8'));
+                    } catch {
+                      sendJson(res, 400, { message: 'Problems parsing JSON' }, requestId);
+                      return;
+                    }
+                  }
+                  const made = createIssue(store, repo, parsed);
+                  sendJson(res, made.status, made.body, requestId, made.headers ?? {});
+                  return;
+                }
+              }
+            }
           }
           if (pathname === '/api/graphql') {
             if (method !== 'POST') {
